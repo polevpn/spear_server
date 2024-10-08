@@ -1,0 +1,18 @@
+{
+    "https":{
+        "listen":"0.0.0.0:443",
+        "cert_file":"./keys/server.crt",
+        "key_file":"./keys/server.key"
+    },
+    "proxy_connect_timeout":5000,
+    "proxy_read_timeout":60000,
+    "upstream_traffic_limit":5242880,
+    "downstream_traffic_limit":10485760,
+    "auth":{
+        "local":{
+            "users":[
+                {"user":"test","pwd":"123456"}
+            ]
+        }
+    }
+}
