@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,9 +18,16 @@ const (
 	READ_BUFFER_SIZE      = 2048
 )
 
+type UserTraffic struct {
+	traffic   uint64
+	startTime time.Time
+}
+
 type HttpServer struct {
 	loginchecker LoginChecker
 	upgrader     *websocket.Upgrader
+	trafficMap   map[string]*UserTraffic
+	rwMutex      *sync.RWMutex
 }
 
 func NewHttpServer() *HttpServer {
@@ -31,7 +39,11 @@ func NewHttpServer() *HttpServer {
 		EnableCompression: false,
 	}
 
-	return &HttpServer{upgrader: upgrader}
+	return &HttpServer{
+		upgrader:   upgrader,
+		trafficMap: make(map[string]*UserTraffic, 0),
+		rwMutex:    &sync.RWMutex{},
+	}
 }
 
 func (hs *HttpServer) SetLoginCheckHandler(loginchecker LoginChecker) {
@@ -67,7 +79,7 @@ func (hs *HttpServer) respError(status int, w http.ResponseWriter) {
 	w.Write([]byte(resp))
 }
 
-func (hs *HttpServer) copyStream(dst net.Conn, src net.Conn, waitTime time.Duration, wg *sync.WaitGroup) (n int64) {
+func (hs *HttpServer) copyStream(user string, dst net.Conn, src net.Conn, waitTime time.Duration, limitTraffic uint64, wg *sync.WaitGroup) (n int64) {
 	defer wg.Done()
 
 	buf := make([]byte, READ_BUFFER_SIZE)
@@ -84,6 +96,13 @@ func (hs *HttpServer) copyStream(dst net.Conn, src net.Conn, waitTime time.Durat
 				break
 			} else {
 				n += int64(nw)
+			}
+		}
+
+		bytes, duration := hs.limitTraffic(user, uint64(nr))
+		if bytes > limitTraffic/20 {
+			if duration > 0 {
+				time.Sleep(duration)
 			}
 		}
 
@@ -134,11 +153,11 @@ func (hs *HttpServer) handleTCP(w http.ResponseWriter, r *http.Request) {
 	var upBytes, downBytes int64
 
 	go func() {
-		upBytes = hs.copyStream(rconn, wsconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), wg)
+		upBytes = hs.copyStream(user, rconn, wsconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), Config.Get("upstream_traffic_limit").AsUint64(100000), wg)
 	}()
 
 	go func() {
-		downBytes = hs.copyStream(wsconn, rconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), wg)
+		downBytes = hs.copyStream(user, wsconn, rconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), Config.Get("downstream_traffic_limit").AsUint64(100000), wg)
 	}()
 
 	wg.Wait()
@@ -199,11 +218,11 @@ func (hs *HttpServer) handleUDP(w http.ResponseWriter, r *http.Request) {
 	var upBytes, downBytes int64
 
 	go func() {
-		upBytes = hs.copyStream(rconn, wsconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), wg)
+		upBytes = hs.copyStream(user, rconn, wsconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), Config.Get("upstream_traffic_limit").AsUint64(100000), wg)
 	}()
 
 	go func() {
-		downBytes = hs.copyStream(wsconn, rconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), wg)
+		downBytes = hs.copyStream(user, wsconn, rconn, time.Millisecond*time.Duration(Config.Get("proxy_read_timeout").AsInt(60000)), Config.Get("downstream_traffic_limit").AsUint64(100000), wg)
 	}()
 
 	wg.Wait()
@@ -247,5 +266,30 @@ func (hs *HttpServer) wsHandler(w http.ResponseWriter, r *http.Request) {
 		elog.Errorf("invalid proto:%v", proto)
 		hs.respError(http.StatusForbidden, w)
 	}
+
+}
+
+func (hs *HttpServer) limitTraffic(user string, traffic uint64) (uint64, time.Duration) {
+
+	hs.rwMutex.RLock()
+	tf := hs.trafficMap[user]
+	hs.rwMutex.RUnlock()
+
+	nowTime := time.Now()
+	if tf == nil { //30  0.1
+		tf = &UserTraffic{traffic, nowTime}
+		hs.rwMutex.Lock()
+		hs.trafficMap[user] = tf
+		hs.rwMutex.Unlock()
+	}
+
+	if nowTime.Sub(tf.startTime) > 50*time.Millisecond {
+		tf.traffic = 0
+		tf.startTime = nowTime
+	}
+
+	atomic.AddUint64(&tf.traffic, traffic)
+
+	return tf.traffic, 50*time.Millisecond - nowTime.Sub(tf.startTime)
 
 }
